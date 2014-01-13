@@ -1,0 +1,10 @@
+# .gitignore for hierarchical-exceptions                           -*- conf -*-
+# This file is in the public domain.
+
+# Editor backup files
+*~
+\#*
+.\#*
+
+# Cabal
+dist*/
