@@ -71,14 +71,15 @@ associated functions; however, only you may only extend abstract exceptions,
 and you may only throw concrete ones.  This is a fundamental limitation of the
 Haskell exception hierarchy system as it currently exists. -}
 
+{-# LANGUAGE TemplateHaskell #-}
+
 module Control.Exception.Hierarchical
        ( mkAbstractException
        , mkException
        ) where
 
-import Control.Exception (Exception(toException, fromException),
-                          SomeException(SomeException))
-import Control.Monad ((>=>))
+import Control.Exception (Exception, SomeException(SomeException))
+import Control.Monad ((<=<), liftM)
 import Data.Typeable (Typeable, cast)
 import Language.Haskell.TH
 
@@ -103,40 +104,30 @@ default implementation for the 'Exception' type class is sufficient in this
 case. -}
 exceptionDeclaration :: Name    -- ^ the name of the super-exception
                         -> Name -- ^ the name of the sub-exception
-                        -> Dec
+                        -> DecsQ
 exceptionDeclaration super name =
-  InstanceD []
-            (AppT (ConT ''Exception) (ConT name))
-            (if super == 'SomeException
-             then
-               {- 'name' is directly under 'SomeException', so use the default
-               implementation for the conversion functions. -}
-               []
-             else
-               {- 'name' is directly under some other exception, so explicitly
-               define the conversion functions to set up the hierarchy
-               correctly. -}
-               exceptionHierarchyFunctions super)
+  one $ instanceD' (cxt [])
+                   [t| Exception $(conT name) |]
+                   (if super == 'SomeException
+                    then
+                      {- 'name' is directly under 'SomeException', so use the
+                      default implementation for the conversion functions. -}
+                      return []
+                    else
+                      {- 'name' is directly under some other exception, so
+                      explicitly define the conversion functions to set up the
+                      hierarchy correctly. -}
+                      exceptionHierarchyFunctions super)
 
 {-| Creates declarations to implement the 'Exception' instance for a
 sub-exception. -}
 exceptionHierarchyFunctions :: Name -- ^ the name of the super-exception
-                               -> [Dec]
+                               -> DecsQ
 exceptionHierarchyFunctions super =
-  let x = mkName "x" in
-  [ -- toException
-    ValD (VarP 'toException)
-         (NormalB (InfixE (Just (VarE 'toException))
-                          (VarE '(.))
-                          (Just (ConE super))))
-         []
-    -- fromException
-  , ValD (VarP 'fromException)
-         (NormalB (InfixE (Just (VarE 'fromException))
-                          (VarE '(>=>))
-                          (Just (LamE [ConP super [VarP x]]
-                                      (AppE (VarE 'cast) (VarE x))))))
-         [] ]
+  [d| toException   = toException . sup
+        where sup = $(conE super)
+      fromException = cast . sub <=< fromException
+        where sub = $(destruct1 super) |]
 
 
 
@@ -148,12 +139,12 @@ extended. -}
 mkAbstractException :: Name
                        -- ^ the name of the super-exception’s data constructor
                        -> String -- ^ the name of the exception to create
-                       -> Q [Dec]
-mkAbstractException super name = do
-  let name' = mkName name
-  return [ abstractDataDeclaration name'
-         , abstractShowDeclaration name'
-         , exceptionDeclaration super name' ]
+                       -> DecsQ
+mkAbstractException super name =
+  let name' = mkName name in
+  many [ abstractDataDeclaration name'
+       , abstractShowDeclaration name'
+       , exceptionDeclaration super name' ]
 
 {-| Defines a new data type suitable for use as an abstract exception.  For
 example,
@@ -162,14 +153,14 @@ example,
 > ======>
 >   data Name = forall e. Exception e => Name e
 >             deriving Typeable -}
-abstractDataDeclaration :: Name -> Dec
+abstractDataDeclaration :: Name -> DecsQ
 abstractDataDeclaration name =
-  let e = mkName "e" in
-  DataD [] name []
-        [ForallC [PlainTV e]
-                 [ClassP ''Exception [VarT e]]
-                 (NormalC name [(NotStrict, VarT e)])]
-        [''Typeable]
+  one $ dataD (cxt []) name []
+              [let e = mkName "e" in
+               forallC [PlainTV e]
+                       (cxt [classP ''Exception [varT e]])
+                       (normalC name [return (NotStrict, VarT e)])]
+              [''Typeable]
 
 {-| Creates an instance declaration for an abstract exception type.  For
 example,
@@ -178,14 +169,11 @@ example,
 > ======>
 >   instance Show Name where
 >     show (Name e) = show e -}
-abstractShowDeclaration :: Name -> Dec
+abstractShowDeclaration :: Name -> DecsQ
 abstractShowDeclaration name =
-  let e = mkName "e" in
-  InstanceD []
-            (AppT (ConT ''Show) (ConT name))
-            [FunD 'show [Clause [ConP name [VarP e]]
-                                (NormalB (AppE (VarE 'show) (VarE e)))
-                                []]]
+  one $ instanceD' (cxt [])
+                   [t| Show $(conT name) |]
+                   [d| show = show . $(destruct1 name) |]
 
 
 ----------------------------- Concrete exceptions -----------------------------
@@ -196,11 +184,11 @@ thrown. -}
 mkException :: Name
                -- ^ the name of the super-exception’s data constructor
                -> String        -- ^ the name of the exception to create
-               -> Q [Dec]
-mkException super name = do
-  let name' = mkName name
-  return [ dataDeclaration name'
-         , exceptionDeclaration super name' ]
+               -> DecsQ
+mkException super name =
+  let name' = mkName name in
+  many [ dataDeclaration name'
+       , exceptionDeclaration super name' ]
 
 {-| Defines a new data type suitable for use as a concrete exception.  For
 example,
@@ -209,8 +197,31 @@ example,
 > ======>
 >   data Name = Name
 >             deriving (Show, Typeable) -}
-dataDeclaration :: Name -> Dec
+dataDeclaration :: Name -> DecsQ
 dataDeclaration name =
-  DataD [] name []
-        [NormalC name []]
-        [''Show, ''Typeable]
+  one $ dataD (cxt []) name []
+              [normalC name []]
+              [''Show, ''Typeable]
+
+
+----------------------------------- Utility -----------------------------------
+
+-- | Lifts 'DecQ' to a singleton 'DecsQ'.
+one :: DecQ -> DecsQ
+one = liftM (:[])
+
+-- | Concatenates multiple 'DecsQ' values.
+many :: [DecsQ] -> DecsQ
+many = liftM concat . sequence
+
+-- | Like 'instanceD', but accepts a 'DecsQ' instead of a '[DecQ]'.
+instanceD' :: CxtQ -> TypeQ -> DecsQ -> DecQ
+instanceD' c t mkDecs = do
+  decs <- mkDecs
+  instanceD c t $ map return decs
+
+-- | Unwraps a single-field constructor.
+destruct1 :: Name -> ExpQ
+destruct1 name = do
+  underlying <- newName "underlying"
+  lam1E (conP name [varP underlying]) (varE underlying)
