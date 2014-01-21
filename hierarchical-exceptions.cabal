@@ -1,6 +1,6 @@
 cabal-version:       >=1.10
 name:                hierarchical-exceptions
-version:             1.0.0
+version:             1.0.1
 synopsis:            Template Haskell functions to easily create exception
  hierarchies
 description:
